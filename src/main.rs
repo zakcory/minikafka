@@ -1,11 +1,14 @@
-use std::{error, fs, io::Write};
+use std::{error, fs, io, path};
+use io::Write;
 use fs::File;
 use error::Error;
+use path::PathBuf;
 use anyhow::{Context, Result};
 
 struct Segment {
     base_offset: u32,
     file: File,
+    file_path: PathBuf,
     size: usize    
 }
 
@@ -17,7 +20,8 @@ impl Segment {
                 file: fs::OpenOptions::new()
                     .append(true)
                     .create(true)
-                    .open(format!("segments/{}.log", base_offset))?,
+                    .open(format!("segments/{:020}.log", base_offset))?,
+                file_path: PathBuf::from(format!("segments/{:020}.log", base_offset)),
                 size: 0
             }
         )
@@ -49,20 +53,20 @@ impl Log {
         Ok(log)
     }
 
-    fn push(&mut self, msg: Vec<u8>) -> Result<(), Box<dyn Error>> {
+    fn push(&mut self, msg: Vec<u8>) -> Result<u32, Box<dyn Error>> {
 
         // We borrow from the segments only to take the size of the last segment and give the borrow back
         let last_seg_size = self.segments
-                                        .last_mut()
-                                        .ok_or_else(|| std::io::Error::other("no segment found"))?
-                                        .size; 
+            .last_mut()
+            .ok_or_else(|| std::io::Error::other("no segment found"))?
+            .size; 
 
         // Check how many bytes are left in the segment and compare it to the mesage
         let bytes_to_write = msg.len();
         let bytes_written;
-        println!("Bytes that will be busy after the write: {}", last_seg_size + bytes_to_write);
-        if last_seg_size + bytes_to_write > self.segment_size {
-            println!("Not enough space on the segment to write the message!");
+
+        if last_seg_size + bytes_to_write > self.segment_size && last_seg_size > 0 {
+            // println!("Not enough space on the segment to write the message!");
             let new_seg = Segment::new(self.next_offset)
                     .context(format!("Failed to create the {}.log segment", self.next_offset))?;
             self.segments.push(
@@ -76,10 +80,50 @@ impl Log {
         last_seg.size += bytes_written;
         
 
-        println!("Wrote {} bytes", bytes_written);
+        // println!("Wrote {} bytes", bytes_written);
+        // println!("Bytes left in the current segment: {}", self.segment_size - last_seg.size);
+        let assigned_offset = self.next_offset;
         self.next_offset += 1;
 
-        Ok(())
+        Ok(assigned_offset)
+    }
+
+    fn read(&self, offset: u32) -> Result<Option<Vec<u8>>>{
+
+        if self.segments.len() == 0 {
+            anyhow::bail!("No segments to read from!");
+        }
+
+        // Get the segment file
+        let wanted_seg = self.segments
+            .iter()
+            .rev()
+            .find(|seg| seg.base_offset <= offset);
+
+
+        // Iterate over the bytes until we get to the message
+        if let Some(seg) = wanted_seg {
+            println!("Found segment with path: {:?}", &seg.file_path);
+            let seg_bytes = fs::read(&seg.file_path)?;
+            let num_msgs = offset - seg.base_offset;
+            let mut counter = 0;
+            for _ in  0..num_msgs {
+                // Get the length of the message
+                let payload: [u8; 4] = seg_bytes[counter..counter + 4].try_into()?;
+                let msg_size = u32::from_le_bytes(payload) as usize;
+
+                // Skip the message
+                counter += 4 + msg_size;
+            }
+
+            let payload: [u8; 4] = seg_bytes[counter..counter + 4].try_into()?;
+            let msg_size = u32::from_le_bytes(payload) as usize;
+            let msg_bytes = seg_bytes[counter + 4..counter + 4 + msg_size].to_vec();
+            Ok(Some(msg_bytes))
+        }
+        else {
+            Ok(None)
+        }
     }
 
 }
@@ -88,12 +132,22 @@ fn main() {
     let seg_size: usize = 100;
     let mut log = Log::new(seg_size).expect("Failed to create the log");
 
-    let msg = String::from("hello0");
+    let msg = String::from("hellol");
     let mut msg_bytes = msg.as_bytes().to_vec();
     let mut length_bytes = (msg.len() as u32).to_le_bytes().to_vec();
-    msg_bytes.append(&mut length_bytes);
+    length_bytes.append(&mut msg_bytes);
 
-    for i in 0..100 {
-        log.push(msg_bytes.clone()).expect("Failed to push the message");
+    for _i in 0..100 {
+        log.push(length_bytes.clone()).expect("Failed to push the message");
+    }
+
+    let msg_bytes = log.read(25).expect("Error reading the message");
+    if let Some(bytes) = msg_bytes {
+        let msg = String::from_utf8(bytes)
+        .expect("The message is not a valid UTF-8 String");
+        println!("{}", msg);
+    }
+    else {
+        println!("No message found for offset {}", 25)
     }
 }
