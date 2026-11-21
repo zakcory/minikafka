@@ -33,6 +33,7 @@ struct Log {
     segments: Vec<Segment>,
     next_offset: u32,
     segment_size: usize,
+    broken: bool,
 }
 
 impl Log {
@@ -49,12 +50,18 @@ impl Log {
             ]),
             next_offset: 0,
             segment_size,
+            broken: false,
         };
 
         Ok(log)
     }
 
     fn push(&mut self, msg: Vec<u8>) -> Result<u32> {
+
+        // We can write to the log only if it's not broken
+        if self.broken {
+            anyhow::bail!("The log is broken for now...")
+        }
 
         // We borrow from the segments only to take the size of the last segment and give the borrow back
         let last_seg_size = self.segments
@@ -76,20 +83,30 @@ impl Log {
         let last_seg = self.segments
                                     .last_mut()
                                     .ok_or_else(|| std::io::Error::other("no segment found"))?;
-        
-        if let Err(err) = last_seg.file.write_all(&msg) {
-            last_seg.file.set_len(last_seg.size as u64).expect("Unable to shrink the file");
-            println!("Error writing the message to the log, rolled the file back... Traceback: {:?}", err);
+
+        if let Err(write_err) = last_seg.file.write_all(&msg) {
+            if let Err(truncate_err) = last_seg.file.set_len(last_seg.size as u64) {
+                self.broken = true;
+                anyhow::bail!("Both writing and truncating the file failed! \n Traceback: {:?} \n {:?}",
+                    write_err, 
+                    truncate_err
+                )
+            }
+            anyhow::bail!("Writing the message failed, rolled the file back... \n Traceback: {:?}",
+                write_err
+            );
+        } else {
+            last_seg.file.sync_data()?;
+
+            last_seg.size += bytes_to_write;
+            // println!("Wrote {} bytes", bytes_to_write);
+            // println!("Bytes left in the current segment: {}", self.segment_size - last_seg.size);
+            let assigned_offset = self.next_offset;
+            self.next_offset += 1;
+
+            Ok(assigned_offset)
         }
-        last_seg.size += bytes_to_write;
         
-
-        // println!("Wrote {} bytes", bytes_to_write);
-        // println!("Bytes left in the current segment: {}", self.segment_size - last_seg.size);
-        let assigned_offset = self.next_offset;
-        self.next_offset += 1;
-
-        Ok(assigned_offset)
     }
 
     fn read(&self, offset: u32) -> Result<Option<Vec<u8>>>{
@@ -150,7 +167,7 @@ fn main() {
         log.push(length_bytes.clone()).expect("Failed to push the message");
     }
 
-    let msg_bytes = log.read(25).expect("Error reading the message");
+    let msg_bytes = log.read(30).expect("Error reading the message");
     if let Some(bytes) = msg_bytes {
         let msg = String::from_utf8(bytes)
         .expect("The message is not a valid UTF-8 String");
